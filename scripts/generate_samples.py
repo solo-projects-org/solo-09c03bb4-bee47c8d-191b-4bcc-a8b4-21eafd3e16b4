@@ -171,9 +171,47 @@ def build_incident() -> None:
     write_manifest(table_dir, [a(0), a(1), a(2), a(3), a(5)])
 
 
+def build_shared_history() -> None:
+    """共用历史 + 区间内跨检查点样例（v0–v7，检查点 v3/v6，v5 提交丢失）。
+
+    用来演示单趟增量重放：v0–v2 的旧提交被全部 8 个版本共用，但每次查询
+    只应用一次；区间内先后遇到 v3、v6 两个检查点，v5 的断档在 v6 检查点
+    处被截断，不带入后段，也不污染较早版本的报告。
+    """
+    table_dir = SAMPLES / "shared_history_table"
+    reset_dir(table_dir)
+    log_dir = table_dir / "_delta_log"
+    log_dir.mkdir(parents=True)
+
+    g = lambda n: f"data/part-{n:05d}-shared.parquet"
+    write_commit(log_dir, 0, [PROTOCOL_ACTION, add_action(g(0)), add_action(g(1))])
+    write_commit(log_dir, 1, [add_action(g(2))])
+    write_commit(log_dir, 2, [add_action(g(3)), remove_action(g(1))])
+    # v3 检查点：活动文件 g0,g2,g3（g1 成墓碑）
+    write_checkpoint(log_dir, 3, [g(0), g(2), g(3)], [g(1)])
+    write_commit(log_dir, 4, [add_action(g(4)), remove_action(g(0))])
+
+    # v5 提交在事故中丢失：本应 add g5，没有任何留存
+    v5_lost = log_dir / commit_name(5)
+    assert not v5_lost.exists()
+
+    # v6 检查点在 v5 提交丢失前生成，仍保留 v5 引入的 g5
+    write_checkpoint(log_dir, 6,
+                     [g(2), g(3), g(4), g(5)], [g(0), g(1)])
+    write_commit(log_dir, 7, [add_action(g(6)), remove_action(g(2))])
+
+    (log_dir / "_last_checkpoint").write_text(json.dumps({
+        "version": 6, "size": 0}), encoding="utf-8")
+
+    # 所有被任一快照引用过的文件（含已逻辑删除但物理保留的 g1）都还在，
+    # 问题只出在 v5 断档，不掺杂数据文件缺失，便于聚焦重放语义
+    write_manifest(table_dir, [g(i) for i in range(7)])
+
+
 def main() -> None:
     build_healthy()
     build_incident()
+    build_shared_history()
     print(f"样例已生成于 {SAMPLES}")
     for table in sorted(SAMPLES.iterdir()):
         if table.is_dir():

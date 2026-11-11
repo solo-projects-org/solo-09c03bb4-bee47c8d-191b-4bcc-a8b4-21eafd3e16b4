@@ -182,6 +182,15 @@
         '<div class="kv">已识别 JSON 提交：' + chips(r.available_commits.map(v => 'v' + v)) + '</div>' +
         '<div class="kv" style="margin-top:8px">已识别检查点：' +
           chips(r.available_checkpoints.map(v => 'v' + v)) + '</div>' +
+        (r.replay_stats ? (
+          '<div class="kv" style="margin-top:8px">本次查询重放统计（单趟增量重放，同一提交最多应用一次）：' +
+            '<div class="chips" style="margin-top:4px">' +
+              '<span class="chip">提交应用 ' + r.replay_stats.commits_applied + ' 次</span>' +
+              '<span class="chip">检查点重置 ' + r.replay_stats.checkpoint_resets.length + ' 次' +
+                (r.replay_stats.checkpoint_resets.length
+                  ? '（v' + r.replay_stats.checkpoint_resets.join('、v') + '）' : '') +
+              '</span>' +
+            '</div></div>') : '') +
         '<div class="kv" style="margin-top:8px">现存清单文件：' + esc((r.manifests || []).join(', ') || '（未上传）') +
           '；清单内现存数据文件 <strong>' + r.existing_file_count + '</strong> 个</div>' +
         (r.duplicate_files && r.duplicate_files.length

@@ -309,3 +309,121 @@ def test_no_manifest_means_every_referenced_file_is_missing():
     assert v2["status"] == STATUS_MISSING_FILES
     assert v2["missing_files"] == sorted([f(0), f(2), f(3)])
     assert report["existing_file_count"] == 0
+
+
+# ---------- 单趟增量重放：同一提交最多应用一次 ----------
+
+def test_each_commit_applied_at_most_once_per_query():
+    # 8 个版本逐版只新增少量文件；旧提交被所有后续版本共用。
+    # 旧实现会为每个目标版本从头重放，v0 的 add 会被执行 8 次。
+    logs = [commit_file(0, [add(f(0))])]
+    logs += [commit_file(v, [add(f(v))]) for v in range(1, 8)]
+    report = analyze(logs, [manifest([f(i) for i in range(8)])], 0, 7)
+
+    stats = report["replay_stats"]
+    # 8 个提交各应用一次，无重复
+    assert stats["commits_applied"] == 8
+    assert sorted(stats["applied_commit_versions"]) == list(range(8))
+    assert len(set(stats["applied_commit_versions"])) == len(
+        stats["applied_commit_versions"])
+    # 结果与逐版重放等价：每版快照恰好包含截至该版的全部文件
+    for ver in report["versions"]:
+        assert ver["status"] == STATUS_RECOVERABLE
+        assert ver["referenced_files"] == sorted(f(i) for i in range(ver["version"] + 1))
+        assert ver["base"] == "commit-0"
+        assert ver["missing_commits"] == []
+
+
+def test_subrange_walk_still_applies_each_commit_once():
+    # 只查询 v4-v7：v0-v3 作为公共前缀仍需重放，但每个也只应用一次
+    logs = [commit_file(0, [add(f(0))])]
+    logs += [commit_file(v, [add(f(v))]) for v in range(1, 8)]
+    report = analyze(logs, [manifest([f(i) for i in range(8)])], 4, 7)
+    stats = report["replay_stats"]
+    assert stats["commits_applied"] == 8
+    assert [v["version"] for v in report["versions"]] == [4, 5, 6, 7]
+    assert report["versions"][0]["referenced_files"] == sorted(f(i) for i in range(5))
+
+
+def test_cross_checkpoint_gap_resets_snapshot_and_missing_commits():
+    # v3 检查点 + v4 缺提交（断档）+ v5 检查点（更晚的检查点必须起新段）
+    logs = [
+        checkpoint_file(3, [f(0), f(1)]),
+        commit_file(4, [add(f(2))]),          # 模拟“留存但在断档中不被采信”
+        checkpoint_file(5, [f(3), f(4)]),
+        commit_file(6, [add(f(5))]),
+        commit_file(7, [remove(f(3))]),
+    ]
+    # 故意不传 v4 提交：把它从日志集合里拿掉
+    logs = [item for item in logs if item.filename != f"{4:020d}.json"]
+    report = analyze(logs, [manifest([f(i) for i in range(6)])], 3, 7)
+    by_ver = {v["version"]: v for v in report["versions"]}
+
+    # v4 断档被明确标出
+    assert by_ver[4]["status"] == STATUS_MISSING_COMMIT
+    assert by_ver[4]["missing_commits"] == [4]
+    # 遇到 v5 检查点：前段断档与文件集合都不带入
+    assert by_ver[5]["base"] == "checkpoint-5"
+    assert by_ver[5]["missing_commits"] == []
+    assert by_ver[5]["referenced_files"] == sorted([f(3), f(4)])
+    assert f(0) not in by_ver[5]["referenced_files"]
+    assert f(1) not in by_ver[5]["referenced_files"]
+    # 新段内的增删正常生效
+    assert by_ver[6]["base"] == "checkpoint-5"
+    assert by_ver[6]["referenced_files"] == sorted([f(3), f(4), f(5)])
+    assert by_ver[7]["referenced_files"] == sorted([f(4), f(5)])
+    assert by_ver[7]["status"] == STATUS_RECOVERABLE
+
+    stats = report["replay_stats"]
+    assert stats["checkpoint_resets"] == [3, 5]
+    # 被检查点覆盖的 v3/v5 提交不会再应用；v4 缺失；只应用 v6、v7
+    assert stats["applied_commit_versions"] == [6, 7]
+    assert stats["commits_applied"] == 2
+
+
+def test_later_adds_and_removes_never_rewrite_earlier_version_reports():
+    # v2 的快照在 emit 时冻结；v3 删 f0、v4 重新加 f0 都不能改写 v2 的结论
+    logs = [
+        commit_file(0, [add(f(0)), add(f(1))]),
+        commit_file(1, [add(f(2))]),
+        commit_file(2, [add(f(3))]),
+        commit_file(3, [remove(f(0))]),
+        commit_file(4, [add(f(0)), remove(f(2))]),
+    ]
+    report = analyze(logs, [manifest([f(i) for i in range(4)])], 0, 4)
+    by_ver = {v["version"]: v for v in report["versions"]}
+
+    frozen = sorted([f(0), f(1), f(2), f(3)])
+    assert by_ver[2]["referenced_files"] == frozen
+    assert by_ver[1]["referenced_files"] == sorted([f(0), f(1), f(2)])
+    assert by_ver[0]["referenced_files"] == sorted([f(0), f(1)])
+    # 后续版本反映的是各自时刻的状态
+    assert by_ver[3]["referenced_files"] == sorted([f(1), f(2), f(3)])
+    assert by_ver[4]["referenced_files"] == sorted([f(0), f(1), f(3)])
+    # 较早版本的报告对象不与后续版本共享可变列表
+    assert by_ver[2]["missing_files"] is not by_ver[3]["missing_files"]
+    assert by_ver[2]["missing_commits"] is not by_ver[4]["missing_commits"]
+
+
+def test_no_base_recovers_when_later_checkpoint_appears():
+    # 没有 commit-0 也没有早于 v2 的检查点：v0-v2 全部判缺提交；
+    # v2 检查点出现后从该检查点起算，前段断档不带入
+    logs = [
+        commit_file(1, [add(f(9))]),          # 无基线阶段不被采信
+        checkpoint_file(2, [f(0), f(1)]),
+        commit_file(3, [add(f(2))]),
+    ]
+    report = analyze(logs, [manifest([f(0), f(1), f(2)])], 0, 3)
+    by_ver = {v["version"]: v for v in report["versions"]}
+
+    assert by_ver[0]["base"] is None
+    assert by_ver[0]["missing_commits"] == [0]
+    assert by_ver[1]["missing_commits"] == [0, 1]
+    assert by_ver[2]["base"] == "checkpoint-2"
+    assert by_ver[2]["missing_commits"] == []
+    assert by_ver[2]["referenced_files"] == sorted([f(0), f(1)])
+    assert f(9) not in by_ver[2]["referenced_files"]
+    assert by_ver[3]["status"] == STATUS_RECOVERABLE
+    assert by_ver[3]["referenced_files"] == sorted([f(0), f(1), f(2)])
+    # 无基线阶段的 v1 提交从未被应用
+    assert 1 not in report["replay_stats"]["applied_commit_versions"]

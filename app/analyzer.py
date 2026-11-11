@@ -2,8 +2,9 @@
 
 值班员上传 ``_delta_log`` 中留存的 JSON 提交（``NNN.json``）、经典单文件
 Parquet 检查点（``NNN.checkpoint.parquet``）以及现存数据文件的表内相对路径
-清单。本模块逐版重放提交 / 检查点，重建每个版本快照仍引用的数据文件，
-再与现存清单核对，判断该版本能否完整重建。
+清单。本模块对整个查询区间做**单趟增量重放**：同一提交在一次查询中最多
+应用一次，遇到更晚的检查点即从该检查点起算（前段文件与断档不带入），
+逐版冻结当时的快照引用，再与现存清单核对，判断每个版本能否完整重建。
 
 仅支持**不包含删除向量（Deletion Vector）**的表；一旦在协议特性或任意
 add 动作中发现删除向量，立即拒绝分析并提示文件来源。
@@ -311,63 +312,131 @@ def _choose_base(target: int,
     return None, None
 
 
-def _replay(target: int,
-            commits: dict[int, ParsedCommit],
-            checkpoints: dict[int, ParsedCheckpoint]) -> dict[str, Any]:
-    """对单个目标版本执行一次完整重放并核对快照引用文件。"""
-    base_kind, base_version = _choose_base(target, commits, checkpoints)
-    missing_commits: list[int] = []
+_NO_BASE_NOTE = "缺少重放起点：版本 0 的提交与不晚于该版本的检查点均未上传"
+
+
+def _replay_range(from_version: int,
+                  to_version: int,
+                  commits: dict[int, ParsedCommit],
+                  checkpoints: dict[int, ParsedCheckpoint]
+                  ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """对整个查询区间执行**单趟增量重放**。
+
+    关键约束（修复反复重放旧提交导致的性能问题）：
+
+    - 同一次查询中，同一提交版本的 add/remove **最多应用一次**：
+      多个目标版本共用的旧提交只在单趟遍历中应用一次，后续版本直接在
+      已累积的快照状态上前进；
+    - 遇到（不晚于当前版本的）检查点时，用检查点的 add 列**整体替换**
+      当前快照并清空断档记录，前段版本的文件集合与缺失提交不带入新段；
+    - 每个目标版本输出时立即冻结当时的快照引用与缺失提交列表，
+      后续版本的增删不会改写较早版本的报告。
+    """
+    base_kind, base_version = _choose_base(from_version, commits, checkpoints)
+
+    # 重放统计：供页面展示“每个提交确实只应用了一次”
+    stats: dict[str, Any] = {
+        "commits_applied": 0,
+        "applied_commit_versions": [],
+        "checkpoint_resets": [],
+    }
+    applied_versions: set[int] = set()
     active: dict[str, dict] = {}
+    missing_commits: list[int] = []
+    base_label: str | None = None
+    note: str | None = None
+    have_base = base_kind is not None
+    reports: list[dict[str, Any]] = []
 
-    if base_kind is None:
-        # 连起点都没有：版本 0 提交与任何检查点均缺失
-        missing_commits = list(range(0, target + 1))
-        return {
-            "base": None,
-            "missing_commits": missing_commits,
-            "active": active,
-            "replay_complete": False,
-            "note": "缺少重放起点：版本 0 的提交与不晚于该版本的检查点均未上传",
-        }
-
-    if base_kind == "checkpoint":
-        ckpt = checkpoints[base_version]
-        for path in ckpt.adds:
-            active[path] = {"from": f"checkpoint-{base_version}"}
-        required_commits = range(base_version + 1, target + 1)
-        base_label = f"checkpoint-{base_version}"
-    else:
-        seed = commits[0]
-        for path, meta in seed.adds:
-            active[path] = {"from": "commit-0"}
-        required_commits = range(1, target + 1)
-        base_label = "commit-0"
-
-    for version in required_commits:
-        commit = commits.get(version)
-        if commit is None:
-            missing_commits.append(version)
-            continue
+    def apply_commit(version: int) -> None:
+        """应用一个提交；同一版本在本次查询中只会进入一次。"""
+        if version in applied_versions:  # 结构性保险：单趟遍历下不应发生
+            return
+        commit = commits[version]
         # 同一提交内按文件中的动作顺序应用；remove 先于 add 生效
         for path in commit.removes:
             active.pop(path, None)
-        for path, meta in commit.adds:
+        for path, _meta in commit.adds:
             active[path] = {"from": f"commit-{version}"}
+        applied_versions.add(version)
+        stats["commits_applied"] += 1
+        stats["applied_commit_versions"].append(version)
 
-    return {
-        "base": base_label,
-        "missing_commits": missing_commits,
-        "active": active,
-        "replay_complete": not missing_commits,
-        "note": None,
-    }
+    def reset_to_checkpoint(version: int) -> None:
+        """从检查点起算：丢弃前段快照与断档，不重放该版本的 JSON 提交。"""
+        ckpt = checkpoints[version]
+        active.clear()
+        for path in ckpt.adds:
+            active[path] = {"from": f"checkpoint-{version}"}
+        missing_commits.clear()
+        # 检查点已含该版本提交的效果，标记后禁止再应用同版本 JSON 提交
+        applied_versions.add(version)
+        stats["checkpoint_resets"].append(version)
+
+    def emit(target: int) -> None:
+        # 立即冻结快照：引用列表在此刻排序拷贝，后续增删无法影响本版报告
+        reports.append({
+            "version": target,
+            "base": base_label,
+            "missing_commits": list(missing_commits),
+            "replay_complete": not missing_commits,
+            "note": note,
+            "referenced_files": sorted(active.keys()),
+        })
+
+    if base_kind == "checkpoint":
+        base_label = f"checkpoint-{base_version}"
+        reset_to_checkpoint(base_version)
+        walk_start = base_version + 1
+    elif base_kind == "commit":
+        seed = commits[0]
+        for path, _meta in seed.adds:
+            active[path] = {"from": "commit-0"}
+        applied_versions.add(0)
+        stats["commits_applied"] += 1
+        stats["applied_commit_versions"].append(0)
+        base_label = "commit-0"
+        walk_start = 1
+    else:
+        # 连起点都没有：在遇到第一个检查点之前，每个版本都计为缺失提交，
+        # 且不把零散提交应用到无基线的空快照上（与逐版重放语义保持一致）
+        note = _NO_BASE_NOTE
+        walk_start = 0
+
+    # 起点本身就是目标版本时（如 commit-0 对 v0、checkpoint-N 对 vN）先出一版
+    if have_base and from_version < walk_start:
+        emit(from_version)
+
+    for version in range(walk_start, to_version + 1):
+        if version in checkpoints:
+            # 更新的检查点：从该检查点起算，前段文件与断档一律不带入
+            reset_to_checkpoint(version)
+            base_label = f"checkpoint-{version}"
+            note = None
+            have_base = True
+        elif not have_base:
+            # 无基线阶段：即便该版本提交恰好存在也不能应用，缺失照实标出
+            missing_commits.append(version)
+        else:
+            commit = commits.get(version)
+            if commit is None:
+                missing_commits.append(version)
+            else:
+                apply_commit(version)
+
+        if version >= from_version:
+            emit(version)
+
+    stats["applied_commit_versions"].sort()
+    stats["checkpoint_resets"].sort()
+    return reports, stats
 
 
 def analyze(log_files: list[InputFile],
             manifest_files: list[InputFile],
             from_version: int,
             to_version: int) -> dict[str, Any]:
-    """分析入口：逐版重放并核对现存数据文件。"""
+    """分析入口：单趟增量重放整个区间，并逐版核对现存数据文件。"""
     if not isinstance(from_version, int) or not isinstance(to_version, int):
         raise AnalyzerError("版本号必须是整数")
     if from_version < 0 or to_version < 0:
@@ -392,15 +461,19 @@ def analyze(log_files: list[InputFile],
         manifest_names.append(item.filename.rsplit("/", 1)[-1])
         existing |= parse_manifest(item.data, item.filename)
 
+    # 整个区间只做一趟增量重放：同一提交最多应用一次，
+    # 遇到更新的检查点即从该检查点起算，每版结果在 emit 时已冻结
+    replay_reports, replay_stats = _replay_range(
+        from_version, to_version, commits, checkpoints)
+
     version_reports = []
     summary = {STATUS_RECOVERABLE: 0,
                STATUS_MISSING_COMMIT: 0,
                STATUS_MISSING_FILES: 0}
 
-    for target in range(from_version, to_version + 1):
-        result = _replay(target, commits, checkpoints)
-        active: dict[str, dict] = result["active"]
-        referenced = sorted(active.keys())
+    for result in replay_reports:
+        target = result["version"]
+        referenced = result["referenced_files"]
         missing_files = sorted(p for p in referenced if p not in existing)
 
         if result["missing_commits"]:
@@ -428,6 +501,7 @@ def analyze(log_files: list[InputFile],
         "range": {"from": from_version, "to": to_version},
         "available_commits": sorted(commits.keys()),
         "available_checkpoints": sorted(checkpoints.keys()),
+        "replay_stats": replay_stats,
         "ignored_files": ignored,
         "duplicate_files": sorted(duplicate),
         "manifests": manifest_names,

@@ -63,6 +63,34 @@ def test_sample_api_healthy_and_incident():
             assert report["summary"]["recoverable"] == expected_recoverable
 
 
+def test_sample_api_shared_history_cross_checkpoint():
+    client = app.test_client()
+    resp = client.post("/api/analyze-sample/shared_history_table")
+    assert resp.status_code == 200, resp.data
+    report = resp.get_json()
+    assert report["range"] == {"from": 0, "to": 7}
+
+    by_ver = {v["version"]: v for v in report["versions"]}
+    # 区间内两个检查点；v5 缺提交，但 v6 检查点截断断档
+    assert report["replay_stats"]["checkpoint_resets"] == [3, 6]
+    assert by_ver[5]["status"] == "missing_commit"
+    assert by_ver[5]["missing_commits"] == [5]
+    assert by_ver[6]["base"] == "checkpoint-6"
+    assert by_ver[6]["missing_commits"] == []
+    assert by_ver[6]["status"] == "recoverable"
+    assert by_ver[7]["status"] == "recoverable"
+    # 同一次查询中每个提交只应用一次：v0–v2、v4、v7 共 5 个；
+    # v3/v6 被检查点覆盖、v5 缺失，均不应用
+    assert report["replay_stats"]["commits_applied"] == 5
+    assert report["replay_stats"]["applied_commit_versions"] == [0, 1, 2, 4, 7]
+    # 较早版本的报告未被后续增删改写
+    assert by_ver[2]["referenced_files"] == sorted([
+        "data/part-00000-shared.parquet",
+        "data/part-00002-shared.parquet",
+        "data/part-00003-shared.parquet",
+    ])
+
+
 def test_unknown_sample_404():
     resp = app.test_client().post("/api/analyze-sample/nope")
     assert resp.status_code == 404
@@ -73,3 +101,5 @@ def test_sample_api_list():
     assert resp.status_code == 200
     names = resp.get_json()
     assert "healthy_table" in names and "incident_table" in names
+    assert "shared_history_table" in names
+    assert names["shared_history_table"]["range"] == [0, 7]
