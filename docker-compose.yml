@@ -1,0 +1,14 @@
+services:
+  delta-recovery:
+    build: .
+    image: delta-recovery-analyzer:latest
+    container_name: delta-recovery-analyzer
+    ports:
+      - "8000:8000"
+    environment:
+      # 内置样例目录（容器内路径）；可通过挂载覆盖
+      SAMPLE_ROOT: /srv/samples
+    volumes:
+      # 把宿主任意 Delta 表目录挂进来，便于用样例之外的真实留存材料验证
+      - ./samples:/srv/samples:ro
+    restart: unless-stopped

@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Delta Lake 版本可恢复性分析</title>
+  <style>
+    :root {
+      --bg: #f4f6fa; --card: #fff; --line: #dce1ea; --text: #1f2733;
+      --muted: #66707d; --blue: #2563eb;
+      --green-bg: #e7f6ec; --green-fg: #1a7f37;
+      --red-bg: #fdeaea; --red-fg: #b42318;
+      --amber-bg: #fef3e2; --amber-fg: #b25e09;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+           background: var(--bg); color: var(--text); line-height: 1.55; }
+    header { background: #0f2742; color: #fff; padding: 22px 28px; }
+    header h1 { margin: 0 0 4px; font-size: 22px; }
+    header p { margin: 0; color: #b8c6d8; font-size: 13px; }
+    main { max-width: 1080px; margin: 24px auto; padding: 0 18px 60px; }
+    .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px;
+            padding: 20px 22px; margin-bottom: 20px; }
+    .card h2 { margin: 0 0 14px; font-size: 17px; }
+    label { display: block; font-weight: 600; font-size: 13px; margin: 12px 0 5px; }
+    .row { display: flex; gap: 14px; flex-wrap: wrap; }
+    .row > div { flex: 1; min-width: 150px; }
+    input[type=number], input[type=file] { width: 100%; padding: 9px 10px;
+            border: 1px solid var(--line); border-radius: 7px; font-size: 14px; background: #fff; }
+    .hint { color: var(--muted); font-size: 12px; margin-top: 4px; }
+    button { cursor: pointer; border: none; border-radius: 7px; font-size: 14px; padding: 10px 18px; }
+    .btn-primary { background: var(--blue); color: #fff; margin-top: 18px; }
+    .btn-primary:disabled { background: #9db4e8; cursor: wait; }
+    .btn-sample { background: #eef2ff; color: #2b4acb; border: 1px solid #c7d2fe;
+                  margin-right: 10px; margin-top: 8px; }
+    .error { background: var(--red-bg); color: var(--red-fg); border: 1px solid #f3c2c2;
+             border-radius: 8px; padding: 12px 16px; margin-bottom: 18px; font-size: 14px; }
+    .summary { display: flex; gap: 14px; flex-wrap: wrap; }
+    .stat { flex: 1; min-width: 160px; border: 1px solid var(--line); border-radius: 8px;
+            padding: 12px 16px; background: #fafbfd; }
+    .stat .num { font-size: 26px; font-weight: 700; }
+    .stat .lbl { font-size: 12px; color: var(--muted); }
+    .badge { display: inline-block; padding: 3px 10px; border-radius: 999px;
+             font-size: 12px; font-weight: 700; white-space: nowrap; }
+    .badge-recoverable { background: var(--green-bg); color: var(--green-fg); }
+    .badge-missing_commit { background: var(--red-bg); color: var(--red-fg); }
+    .badge-missing_files { background: var(--amber-bg); color: var(--amber-fg); }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 10px 8px; text-align: left;
+             vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; background: #fafbfd; }
+    .ver { font-weight: 700; font-family: ui-monospace, monospace; }
+    .filelist { margin: 6px 0 0; padding-left: 18px; font-family: ui-monospace, monospace;
+                font-size: 12px; word-break: break-all; }
+    .filelist li.missing { color: var(--red-fg); font-weight: 700; }
+    .filelist li.ok { color: #374151; }
+    .miss-commits { color: var(--red-fg); font-weight: 700; font-family: ui-monospace, monospace; }
+    .kv { font-size: 13px; color: var(--muted); }
+    .kv code { background: #f1f4f9; padding: 1px 6px; border-radius: 4px; color: #334155; }
+    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; }
+    .chip { background: #f1f4f9; border-radius: 6px; padding: 2px 9px; font-size: 12px;
+            font-family: ui-monospace, monospace; color: #334155; }
+    .ignored { font-size: 12px; color: var(--muted); }
+    .ignored strong { color: #9a6a1c; }
+    details { margin-top: 8px; }
+    summary { cursor: pointer; font-size: 12px; color: var(--blue); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Delta Lake 版本可恢复性分析</h1>
+    <p>上传 _delta_log 留存的 JSON 提交 / 经典单文件 Parquet 检查点与现存数据文件清单，
+       逐版重放并核对快照引用，找出文件齐全、可完整重建的版本。仅支持无删除向量的表。</p>
+  </header>
+
+  <main>
+    {% if error %}<div class="error">❌ {{ error }}</div>{% endif %}
+
+    <section class="card">
+      <h2>1. 填写版本区间并上传材料</h2>
+      <form method="post" action="/analyze" enctype="multipart/form-data" id="analyze-form">
+        <div class="row">
+          <div>
+            <label for="from_version">起始版本</label>
+            <input type="number" id="from_version" name="from_version" min="0"
+                   value="{{ form.from_version if form else 0 }}" required>
+          </div>
+          <div>
+            <label for="to_version">结束版本</label>
+            <input type="number" id="to_version" name="to_version" min="0"
+                   value="{{ form.to_version if form else 4 }}" required>
+          </div>
+        </div>
+        <label for="log_files">_delta_log 留存文件（可多选：*.json 提交、*.checkpoint.parquet 检查点）</label>
+        <input type="file" id="log_files" name="log_files" multiple
+               accept=".json,.parquet" required>
+        <div class="hint">文件名须保持 20 位补零版本号，如 00000000000000000003.json、
+          00000000000000000002.checkpoint.parquet</div>
+        <label for="manifest_files">现存数据文件表内相对路径清单（可多选，每行一个路径）</label>
+        <input type="file" id="manifest_files" name="manifest_files" multiple accept=".txt,.csv">
+        <div class="hint">例如 data/part-00000-aaa.parquet；缺失清单时所有引用文件都会被判为缺失</div>
+        <button class="btn-primary" type="submit" id="submit-btn">开始逐版分析</button>
+      </form>
+    </section>
+
+    <section class="card">
+      <h2>2. 或直接加载本地样例</h2>
+      <div>
+        {% for key, meta in samples.items() %}
+        <button class="btn-sample" data-sample="{{ key }}"
+                data-from="{{ meta.range[0] }}" data-to="{{ meta.range[1] }}">
+          {{ meta.label }}
+        </button>
+        {% endfor %}
+      </div>
+      <div class="hint">样例由 Docker 镜像内 samples/ 目录提供，点击即调用后端 API 完成分析。</div>
+    </section>
+
+    <section id="report-root"></section>
+  </main>
+
+  {% if report %}
+  <script type="application/json" id="report-data">{{ report | tojson }}</script>
+  {% endif %}
+  <script>
+    const STATUS_TEXT = {
+      recoverable: "可重建 · 文件齐全",
+      missing_commit: "缺失提交，重放中断",
+      missing_files: "重放完整但缺数据文件"
+    };
+
+    function esc(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+    }
+
+    function chips(values) {
+      if (!values || !values.length) return '<span class="kv">无</span>';
+      return '<div class="chips">' +
+        values.map(v => '<span class="chip">' + esc(v) + '</span>').join('') + '</div>';
+    }
+
+    function renderReport(r) {
+      const s = r.summary;
+      const rows = r.versions.map(v => {
+        const files = v.referenced_files.map(p => {
+          const miss = v.missing_files.includes(p);
+          return '<li class="' + (miss ? 'missing' : 'ok') + '">' +
+            (miss ? '✗ 缺失 ' : '✓ ') + esc(p) + '</li>';
+        }).join('');
+        return '<tr>' +
+          '<td class="ver">v' + v.version + '</td>' +
+          '<td><span class="badge badge-' + v.status + '">' + STATUS_TEXT[v.status] + '</span></td>' +
+          '<td class="kv">' + (v.base ? '起点 <code>' + esc(v.base) + '</code>' : '无可用起点') +
+            (v.note ? '<br>' + esc(v.note) : '') + '</td>' +
+          '<td>' + (v.missing_commits.length
+              ? '<span class="miss-commits">缺提交号：' +
+                v.missing_commits.map(c => 'v' + c).join(', ') + '</span>'
+              : '<span class="kv">连续无断档</span>') + '</td>' +
+          '<td><div class="kv">快照引用 ' + v.referenced_file_count + ' 个文件，' +
+            '缺失 ' + v.missing_files.length + ' 个</div>' +
+            (files ? '<details><summary>查看文件核对明细</summary><ul class="filelist">' +
+              files + '</ul></details>' : '') + '</td>' +
+          '</tr>';
+      }).join('');
+
+      const ignored = (r.ignored_files || []).map(i =>
+        '<div class="ignored">• <strong>' + esc(i.name) + '</strong>：' + esc(i.reason) + '</div>'
+      ).join('');
+
+      return '' +
+      '<section class="card"><h2>分析结论总览（v' + r.range.from + ' – v' + r.range.to + '）</h2>' +
+        '<div class="summary">' +
+          '<div class="stat"><div class="num" style="color:var(--green-fg)">' + s.recoverable +
+            '</div><div class="lbl">可重建且文件齐全</div></div>' +
+          '<div class="stat"><div class="num" style="color:var(--red-fg)">' + s.missing_commit +
+            '</div><div class="lbl">缺失提交号 / 重放中断</div></div>' +
+          '<div class="stat"><div class="num" style="color:var(--amber-fg)">' + s.missing_files +
+            '</div><div class="lbl">重放完整但缺数据文件</div></div>' +
+        '</div></section>' +
+      '<section class="card"><h2>输入材料盘点</h2>' +
+        '<div class="kv">已识别 JSON 提交：' + chips(r.available_commits.map(v => 'v' + v)) + '</div>' +
+        '<div class="kv" style="margin-top:8px">已识别检查点：' +
+          chips(r.available_checkpoints.map(v => 'v' + v)) + '</div>' +
+        '<div class="kv" style="margin-top:8px">现存清单文件：' + esc((r.manifests || []).join(', ') || '（未上传）') +
+          '；清单内现存数据文件 <strong>' + r.existing_file_count + '</strong> 个</div>' +
+        (r.duplicate_files && r.duplicate_files.length
+          ? '<div class="ignored" style="margin-top:8px">重复上传已去重：' +
+            r.duplicate_files.map(esc).join(', ') + '</div>' : '') +
+        (ignored ? '<div style="margin-top:8px">' + ignored + '</div>' : '') +
+      '</section>' +
+      '<section class="card"><h2>逐版重放与文件核对</h2>' +
+        '<table><thead><tr><th>版本</th><th>结论</th><th>重放起点</th>' +
+        '<th>缺失提交</th><th>快照引用文件核对</th></tr></thead><tbody>' +
+        rows + '</tbody></table></section>';
+    }
+
+    function showError(msg) {
+      document.getElementById('report-root').innerHTML =
+        '<div class="error">❌ ' + esc(msg) + '</div>';
+      window.scrollTo({top: 0, behavior: 'smooth'});
+    }
+
+    const embedded = document.getElementById('report-data');
+    if (embedded) {
+      document.getElementById('report-root').innerHTML =
+        renderReport(JSON.parse(embedded.textContent));
+    }
+
+    document.getElementById('analyze-form').addEventListener('submit', () => {
+      document.getElementById('submit-btn').disabled = true;
+      document.getElementById('submit-btn').textContent = '分析中…';
+    });
+
+    document.querySelectorAll('.btn-sample').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        btn.disabled = true;
+        try {
+          const resp = await fetch('/api/analyze-sample/' + btn.dataset.sample, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              from_version: Number(btn.dataset.from),
+              to_version: Number(btn.dataset.to)
+            })
+          });
+          const data = await resp.json();
+          if (!resp.ok) { showError(data.error || '样例分析失败'); return; }
+          document.getElementById('report-root').innerHTML = renderReport(data);
+          document.getElementById('from_version').value = btn.dataset.from;
+          document.getElementById('to_version').value = btn.dataset.to;
+          window.scrollTo({top: document.body.scrollHeight, behavior: 'smooth'});
+        } catch (e) {
+          showError('请求样例接口失败：' + e);
+        } finally {
+          btn.disabled = false;
+        }
+      });
+    });
+  </script>
+</body>
+</html>

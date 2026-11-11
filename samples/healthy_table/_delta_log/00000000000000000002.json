@@ -1,0 +1,2 @@
+{"add": {"path": "data/part-00003-healthy.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
+{"remove": {"path": "data/part-00001-healthy.parquet", "deletionTimestamp": 1700000100000, "dataChange": true}}

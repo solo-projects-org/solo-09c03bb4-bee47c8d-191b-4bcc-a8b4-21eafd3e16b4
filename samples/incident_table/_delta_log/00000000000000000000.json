@@ -1,0 +1,3 @@
+{"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}
+{"add": {"path": "data/part-00000-incident.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
+{"add": {"path": "data/part-00001-incident.parquet", "partitionValues": {}, "size": 1024, "modificationTime": 1700000000000, "dataChange": true}}
